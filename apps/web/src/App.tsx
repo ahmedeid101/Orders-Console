@@ -1,5 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import "./App.css";
+import { AuthProvider, useAuth } from "./AuthContext";
+import { LoginPage } from "./LoginPage";
+import { CreateOrderForm } from "./CreateOrderForm";
 
 type OrderStatus =
   | "PENDING"
@@ -30,7 +33,7 @@ type OrdersResponse = {
 const API_URL =
   import.meta.env.VITE_API_URL ?? "http://localhost:3000/api";
 
-const PAGE_SIZE = 10;
+const PAGE_SIZE = 20;
 
 const statuses: Array<"ALL" | OrderStatus> = [
   "ALL",
@@ -53,41 +56,47 @@ const formatDate = (date: string) =>
     timeStyle: "short",
   }).format(new Date(date));
 
-function App() {
-  const [search, setSearch] = useState("");
+// ── Orders list (shown after login) ────────────────────────────────────────
+
+function OrdersApp() {
+  const { user, logout, authHeader } = useAuth();
+
+  const [search, setSearch]               = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
-  const [status, setStatus] = useState<"ALL" | OrderStatus>("ALL");
-  const [sortBy, setSortBy] = useState("createdAt");
-  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
-
-  const [cursor, setCursor] = useState<string | null>(null);
+  const [status, setStatus]               = useState<"ALL" | OrderStatus>("ALL");
+  const [sortBy, setSortBy]               = useState("createdAt");
+  const [sortOrder, setSortOrder]         = useState<"asc" | "desc">("desc");
+  const [cursor, setCursor]               = useState<string | null>(null);
   const [cursorHistory, setCursorHistory] = useState<string[]>([]);
+  const [orders, setOrders]               = useState<Order[]>([]);
+  const [nextCursor, setNextCursor]       = useState<string | null>(null);
+  const [hasMore, setHasMore]             = useState(false);
+  const [loading, setLoading]             = useState(true);
+  const [error, setError]                 = useState<string | null>(null);
+  const [showCreate, setShowCreate]       = useState(false);
 
-  const [orders, setOrders] = useState<Order[]>([]);
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [hasMore, setHasMore] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  // Debounce typing to avoid sending a request for every keystroke.
+  // Debounce: wait 300 ms after the user stops typing before fetching.
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setDebouncedSearch(search.trim());
     }, 300);
-
     return () => window.clearTimeout(timer);
   }, [search]);
 
-  // Reset pagination when filters or sorting change.
+  // Any filter change resets pagination to page 1.
   useEffect(() => {
     setCursor(null);
     setCursorHistory([]);
   }, [debouncedSearch, status, sortBy, sortOrder]);
 
-  useEffect(() => {
+  // The fetch effect. AbortController cancels in-flight requests when deps
+  // change — this is the STALE-RESPONSE GUARD.
+  // TanStack Query would manage this automatically via its `signal` param;
+  // here we do it manually so there is no dependency on the library.
+  const fetchOrders = useCallback(() => {
     const controller = new AbortController();
 
-    async function loadOrders() {
+    async function load() {
       setLoading(true);
       setError(null);
 
@@ -97,23 +106,15 @@ function App() {
         sortOrder,
       });
 
-      if (debouncedSearch) {
-        params.set("search", debouncedSearch);
-      }
-
-      if (status !== "ALL") {
-        params.set("status", status);
-      }
-
-      if (cursor) {
-        params.set("cursor", cursor);
-      }
+      if (debouncedSearch) params.set("search", debouncedSearch);
+      if (status !== "ALL") params.set("status", status);
+      if (cursor) params.set("cursor", cursor);
 
       try {
-        const response = await fetch(
-          `${API_URL}/orders?${params.toString()}`,
-          { signal: controller.signal },
-        );
+        const response = await fetch(`${API_URL}/orders?${params}`, {
+          signal: controller.signal,
+          headers: authHeader(),
+        });
 
         if (!response.ok) {
           const body = await response.json().catch(() => null);
@@ -125,6 +126,9 @@ function App() {
 
         const result: OrdersResponse = await response.json();
 
+        // Only apply the result if this request is still the current one.
+        // If the user changed filters while this was in flight, controller
+        // will have been aborted and we skip the state update.
         if (!controller.signal.aborted) {
           setOrders(result.data);
           setHasMore(result.pagination.hasMore);
@@ -148,36 +152,35 @@ function App() {
       }
     }
 
-    void loadOrders();
-
+    void load();
+    // Return the abort function so useEffect can call it on cleanup.
     return () => controller.abort();
-  }, [debouncedSearch, status, sortBy, sortOrder, cursor]);
+  }, [debouncedSearch, status, sortBy, sortOrder, cursor, authHeader]);
+
+  useEffect(() => {
+    return fetchOrders();
+  }, [fetchOrders]);
 
   function goToNextPage() {
     if (!nextCursor || !hasMore || loading) return;
-
-    setCursorHistory((history) => [...history, nextCursor]);
+    setCursorHistory((h) => [...h, nextCursor]);
     setCursor(nextCursor);
   }
 
   function goToPreviousPage() {
     if (cursorHistory.length === 0 || loading) return;
-
     const previousHistory = cursorHistory.slice(0, -1);
     const previousCursor =
       previousHistory.length > 0
         ? previousHistory[previousHistory.length - 1]
         : null;
-
     setCursorHistory(previousHistory);
     setCursor(previousCursor);
   }
 
   function changeSort(field: string) {
     if (sortBy === field) {
-      setSortOrder((current) =>
-        current === "asc" ? "desc" : "asc",
-      );
+      setSortOrder((o) => (o === "asc" ? "desc" : "asc"));
     } else {
       setSortBy(field);
       setSortOrder(field === "createdAt" ? "desc" : "asc");
@@ -194,7 +197,18 @@ function App() {
           <span>Orders Console</span>
         </a>
 
-        <span className="environment-label">Development</span>
+        <div className="topbar-right">
+          <span className="topbar-user">
+            {user?.name} · <span className="role-tag">{user?.role}</span>
+          </span>
+          <button
+            type="button"
+            className="logout-button"
+            onClick={logout}
+          >
+            Sign out
+          </button>
+        </div>
       </header>
 
       <section className="page-content">
@@ -207,12 +221,37 @@ function App() {
             </p>
           </div>
 
-          <div className="order-count">
-            <span className="count-indicator" />
-            Live API connection
+          <div className="heading-actions">
+            <div className="order-count">
+              <span className="count-indicator" />
+              Live API
+            </div>
+            <button
+              type="button"
+              id="toggle-create-form"
+              className="create-button"
+              onClick={() => setShowCreate((v) => !v)}
+            >
+              {showCreate ? "✕ Close" : "+ New order"}
+            </button>
           </div>
         </div>
 
+        {/* ── Create-order panel ──────────────────────────────────────── */}
+        {showCreate && (
+          <section className="dashboard-card create-panel">
+            <CreateOrderForm
+              onCreated={() => {
+                setShowCreate(false);
+                // Refresh the list by resetting cursor (triggers the effect).
+                setCursor(null);
+                setCursorHistory([]);
+              }}
+            />
+          </section>
+        )}
+
+        {/* ── Orders table ────────────────────────────────────────────── */}
         <section className="dashboard-card">
           <div className="toolbar">
             <label className="search-box">
@@ -220,8 +259,8 @@ function App() {
               <input
                 type="search"
                 value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search customer, email, or order..."
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search customer, email, or order…"
                 aria-label="Search orders"
               />
               {search && (
@@ -240,13 +279,13 @@ function App() {
               <span>Status</span>
               <select
                 value={status}
-                onChange={(event) =>
-                  setStatus(event.target.value as "ALL" | OrderStatus)
+                onChange={(e) =>
+                  setStatus(e.target.value as "ALL" | OrderStatus)
                 }
               >
-                {statuses.map((item) => (
-                  <option key={item} value={item}>
-                    {item === "ALL" ? "All statuses" : item}
+                {statuses.map((s) => (
+                  <option key={s} value={s}>
+                    {s === "ALL" ? "All statuses" : s}
                   </option>
                 ))}
               </select>
@@ -262,11 +301,7 @@ function App() {
               <button
                 type="button"
                 className="retry-button"
-                onClick={() => {
-                  // Changing cursor triggers a fresh request.
-                  setCursor((current) => current);
-                  window.location.reload();
-                }}
+                onClick={() => fetchOrders()}
               >
                 Retry
               </button>
@@ -282,7 +317,12 @@ function App() {
                       className="sort-button"
                       onClick={() => changeSort("orderNumber")}
                     >
-                      Order {sortBy === "orderNumber" ? (sortOrder === "asc" ? "↑" : "↓") : "↕"}
+                      Order{" "}
+                      {sortBy === "orderNumber"
+                        ? sortOrder === "asc"
+                          ? "↑"
+                          : "↓"
+                        : "↕"}
                     </button>
                   </th>
                   <th>Customer</th>
@@ -292,7 +332,12 @@ function App() {
                       className="sort-button"
                       onClick={() => changeSort("totalAmount")}
                     >
-                      Total {sortBy === "totalAmount" ? (sortOrder === "asc" ? "↑" : "↓") : "↕"}
+                      Total{" "}
+                      {sortBy === "totalAmount"
+                        ? sortOrder === "asc"
+                          ? "↑"
+                          : "↓"
+                        : "↕"}
                     </button>
                   </th>
                   <th>
@@ -300,7 +345,12 @@ function App() {
                       className="sort-button"
                       onClick={() => changeSort("createdAt")}
                     >
-                      Created {sortBy === "createdAt" ? (sortOrder === "asc" ? "↑" : "↓") : "↕"}
+                      Created{" "}
+                      {sortBy === "createdAt"
+                        ? sortOrder === "asc"
+                          ? "↑"
+                          : "↓"
+                        : "↕"}
                     </button>
                   </th>
                 </tr>
@@ -311,7 +361,7 @@ function App() {
                   <tr>
                     <td colSpan={5} className="table-message">
                       <span className="spinner" />
-                      Loading orders...
+                      Loading orders…
                     </td>
                   </tr>
                 ) : error ? (
@@ -368,7 +418,7 @@ function App() {
           <footer className="table-footer">
             <span>
               {loading
-                ? "Loading results..."
+                ? "Loading results…"
                 : `${orders.length} orders on this page`}
             </span>
 
@@ -395,12 +445,26 @@ function App() {
         </section>
 
         <p className="footnote">
-          Results are fetched from the API using server-side filtering and
-          cursor pagination.
+          Results are fetched via cursor pagination. The{" "}
+          <code>?delay=</code> query param adds artificial latency for
+          race-condition demos.
         </p>
       </section>
     </main>
   );
 }
 
-export default App;
+// ── Root: login gate ────────────────────────────────────────────────────────
+
+function AppInner() {
+  const { user } = useAuth();
+  return user ? <OrdersApp /> : <LoginPage />;
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppInner />
+    </AuthProvider>
+  );
+}
